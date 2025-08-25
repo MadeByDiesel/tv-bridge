@@ -21,10 +21,8 @@ sudo npm install -g pm2
 npm install
 
 # Start with pm2
-pm2 start server.js --name tv-bridge
+pm2 start server.js --name tv-tradovate-bridge
 pm2 save
 pm2 startup -u $USER --hp $HOME >/dev/null 2>&1 || true
 
-echo "✅ Done. Service: tv-bridge"
-echo "➡️  Health:  curl http://<your-ip>:3000/health"
-echo "➡️  Webhook: http://<your-ip>:3000/webhook"
+echo "✅ Done. Service: tv-tradovate-bridge"
