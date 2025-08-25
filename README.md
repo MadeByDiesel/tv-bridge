@@ -20,7 +20,6 @@ Bridge for **TradingView → Tradovate** market orders.
 
 ## Run (local)
 
-```bash
 cp .env.sample .env
 npm install
 npm start
