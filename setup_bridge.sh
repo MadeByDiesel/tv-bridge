@@ -2,7 +2,7 @@
 # setup_bridge.sh - one-time VPS setup for trading-bot-server
 set -e
 
-echo "🚀 Setting up tv-bridge..."
+echo "🚀 Setting up tv-tradovate-bridge..."
 
 # System update
 sudo apt-get update -y
