@@ -1,185 +1,123 @@
-// server.js
-require('dotenv').config();
-const express = require('express');
-const axios = require('axios');
+// server.js (final, consistent)
+require("dotenv").config();
+const express = require("express");
+const axios = require("axios");
 
 const app = express();
+app.use(express.json());
+
+// --- Config ---
 const PORT = process.env.PORT || 3000;
+const ENV = (process.env.TRADOVATE_ENV || "demo").toLowerCase();
+const BASE_URL =
+  ENV === "live"
+    ? "https://live.tradovateapi.com/v1"
+    : "https://demo.tradovateapi.com/v1"; // demo or live
 
-// ---- Env & Config ----
-const BASE_URL = process.env.TRADOVATE_BASE_URL; // e.g. https://demo.tradovateapi.com
-const CLIENT_ID = process.env.TRADOVATE_CLIENT_ID;
-const CLIENT_SECRET = process.env.TRADOVATE_CLIENT_SECRET;
-const USERNAME = process.env.TRADOVATE_USERNAME || '';   // optional
-const PASSWORD = process.env.TRADOVATE_PASSWORD || '';   // optional
-const APP_ID = process.env.TRADOVATE_APP_ID || 'tv-bridge';
-const APP_VERSION = process.env.TRADOVATE_APP_VERSION || '1.0.0';
-const ACCOUNT_ID = parseInt(process.env.TRADOVATE_ACCOUNT_ID || '0', 10);
-
-// Basic validation on boot
-if (!BASE_URL || !CLIENT_ID || !CLIENT_SECRET || !ACCOUNT_ID) {
-  console.error('❌ Missing required env vars. Check .env file.');
-  process.exit(1);
-}
-
-// Accept JSON or raw text (TV sometimes posts text)
-app.use(express.json({ type: ['application/json', 'text/plain'] }));
-
-// ---- Token cache ----
-let tokenCache = {
-  accessToken: null,
-  expiresAt: 0
+const CREDS = {
+  name: process.env.TRADOVATE_USERNAME,
+  password: process.env.TRADOVATE_PASSWORD,
+  appId: process.env.TRADOVATE_APP_ID,
+  appSecret: process.env.TRADOVATE_APP_SECRET
 };
 
-async function getAccessToken() {
-  const now = Date.now();
-  if (tokenCache.accessToken && tokenCache.expiresAt - now > 30_000) {
-    return tokenCache.accessToken;
-  }
+const ACCOUNT_ID = Number(process.env.TRADOVATE_ACCOUNT_ID);
 
-  const url = `${BASE_URL}/v1/auth/accessToken`;
+// --- Auth cache ---
+let accessToken = null;
+let tokenExpiresAt = 0; // epoch ms
+
+async function authenticate(force = false) {
+  if (!force && accessToken && Date.now() < tokenExpiresAt - 15_000) return accessToken;
+
+  const url = `${BASE_URL}/auth/accesstokenrequest`;
+  const body = { ...CREDS };
+  const { data } = await axios.post(url, body, { timeout: 15000 });
+
+  // data: { accessToken, expiresIn (seconds), ... }
+  accessToken = data.accessToken;
+  tokenExpiresAt = Date.now() + (data?.expiresIn ? data.expiresIn * 1000 : 5 * 60 * 1000);
+  console.log(`✅ Authenticated to Tradovate (${ENV})`);
+  return accessToken;
+}
+
+async function tdRequest(method, path, payload) {
+  try {
+    const token = await authenticate();
+    return await axios({
+      method,
+      url: `${BASE_URL}${path}`,
+      headers: { Authorization: `Bearer ${token}` },
+      data: payload,
+      timeout: 20000
+    });
+  } catch (err) {
+    // If unauthorized, refresh once and retry
+    if (err.response?.status === 401) {
+      await authenticate(true);
+      return axios({
+        method,
+        url: `${BASE_URL}${path}`,
+        headers: { Authorization: `Bearer ${accessToken}` },
+        data: payload,
+        timeout: 20000
+      });
+    }
+    throw err;
+  }
+}
+
+// --- Place market order ---
+async function placeMarketOrder(symbol, side, qty = 1) {
+  // Normalize side from alert ("buy"/"sell" -> "Buy"/"Sell")
+  const s = (side || "").toLowerCase();
+  if (s === "flat") {
+    // NOTE: Flattening is acknowledged but **not** executed here to keep
+    // the app minimal & consistent. We can implement true flatten on request.
+    console.log(`ℹ️ Received 'flat' for ${symbol}. (No-op placeholder)`);
+    return { ok: true, note: "flat placeholder" };
+  }
+  if (s !== "buy" && s !== "sell") throw new Error(`Invalid side: ${side}`);
+
   const payload = {
-    clientId: CLIENT_ID,
-    clientSecret: CLIENT_SECRET,
-    appId: APP_ID,
-    appVersion: APP_VERSION
-  };
-  // If you use user credentials with client creds, include them (Tradovate supports both flows)
-  if (USERNAME && PASSWORD) {
-    payload.name = USERNAME;
-    payload.password = PASSWORD;
-  }
-
-  const { data } = await axios.post(url, payload, { timeout: 10_000 });
-  if (!data || !data.accessToken || !data.expirationTime) {
-    throw new Error('Bad token response from Tradovate');
-  }
-
-  tokenCache.accessToken = data.accessToken;
-  tokenCache.expiresAt = new Date(data.expirationTime).getTime(); // server returns ISO date
-  return tokenCache.accessToken;
-}
-
-// ---- Utils: normalize incoming webhook ----
-function normalizeSignal(rawBody) {
-  let payload = rawBody;
-
-  if (typeof payload === 'string') {
-    try { payload = JSON.parse(payload); } catch (_) {}
-  }
-
-  if (payload && typeof payload.message === 'string') {
-    try {
-      const inner = JSON.parse(payload.message);
-      if (inner && typeof inner === 'object') payload = inner;
-    } catch (_) {}
-  }
-
-  const symbol = String(payload.symbol || payload.ticker || '').trim().toUpperCase();
-  const sideRaw = String(payload.side || payload.action || payload.signal || '').trim().toLowerCase();
-  const qty = payload.qty != null ? Number(payload.qty) : null;
-
-  const sideMap = {
-    buy: 'buy', long: 'buy',
-    sell: 'sell', short: 'sell',
-    flat: 'flat', exit: 'flat', close: 'flat'
-  };
-  const side = sideMap[sideRaw] || null;
-
-  if (!symbol || !side) {
-    const err = new Error('Missing symbol or side');
-    err.status = 400;
-    throw err;
-  }
-  if ((side === 'buy' || side === 'sell') && (!Number.isFinite(qty) || qty <= 0)) {
-    const err = new Error('Missing/invalid qty for buy/sell');
-    err.status = 400;
-    throw err;
-  }
-
-  return { symbol, side, qty: side === 'flat' ? 0 : Math.trunc(qty) };
-}
-
-// ---- Tradovate REST helpers ----
-async function placeMarketOrder({ symbol, side, qty }) {
-  const accessToken = await getAccessToken();
-
-  // Tradovate expects Buy/Sell (capitalized)
-  const action = side === 'buy' ? 'Buy' : 'Sell';
-
-  const url = `${BASE_URL}/v1/order/placeOrder`;
-  const body = {
     accountId: ACCOUNT_ID,
-    action,
-    symbol,            // Assumes symbol acceptable by your Tradovate setup
-    orderQty: qty,
-    orderType: 'Market',
+    action: s === "buy" ? "Buy" : "Sell",
+    symbol,
+    orderType: "Market",
+    orderQty: Number(qty) || 1,
+    timeInForce: "GTC"
   };
 
-  const { data } = await axios.post(url, body, {
-    headers: { Authorization: `Bearer ${accessToken}` },
-    timeout: 10_000
-  });
-
+  const { data } = await tdRequest("post", "/order/placeorder", payload);
+  console.log(`✅ Market ${payload.action} ${payload.orderQty} ${symbol}`, data?.orderId || "");
   return data;
 }
 
-async function getOpenNetPosition(symbol) {
-  // Optional helper to implement FLAT by offsetting net position.
-  // If you don’t need auto-flat from server, you can skip this.
-  const accessToken = await getAccessToken();
-  const url = `${BASE_URL}/v1/position/list`;
-  const { data } = await axios.get(url, {
-    headers: { Authorization: `Bearer ${accessToken}` },
-    timeout: 10_000
+// --- Routes ---
+app.get("/health", (req, res) => {
+  res.json({
+    ok: true,
+    env: ENV,
+    baseUrl: BASE_URL,
+    accountId: ACCOUNT_ID || null
   });
-
-  // data is typically an array of positions; filter by symbol if provided
-  const positions = Array.isArray(data) ? data : [];
-  const p = positions.find(p => (p.symbol || '').toUpperCase() === symbol.toUpperCase());
-  if (!p) return 0;
-
-  // Tradovate returns netPos or netPosition fields depending on API version
-  const net = Number(p.netPos ?? p.netPosition ?? 0);
-  return Number.isFinite(net) ? net : 0;
-}
-
-async function closeToFlat(symbol) {
-  // Query current net position, then offset with a market order
-  const net = await getOpenNetPosition(symbol);
-  if (net === 0) return { ok: true, info: 'Already flat' };
-  const side = net > 0 ? 'sell' : 'buy';
-  const qty = Math.abs(net);
-  const result = await placeMarketOrder({ symbol, side, qty });
-  return { ok: true, result };
-}
-
-// ---- Routes ----
-app.get('/health', (_req, res) => {
-  res.json({ ok: true, app: 'tv-bridge' });
 });
 
-app.post('/webhook', async (req, res) => {
+app.post("/webhook", async (req, res) => {
   try {
-    const signal = normalizeSignal(req.body);
-    console.log('[Webhook]', new Date().toISOString(), signal);
-
-    if (signal.side === 'flat') {
-      const flatRes = await closeToFlat(signal.symbol);
-      console.log('[Flat]', flatRes);
-      return res.status(200).json({ ok: true, action: 'flat', detail: flatRes });
+    const { symbol, side, qty } = req.body || {};
+    if (!symbol || !side) {
+      return res.status(400).json({ ok: false, error: "Missing symbol or side" });
     }
-
-    const apiRes = await placeMarketOrder(signal);
-    console.log('[Order OK]', apiRes);
-    res.status(200).json({ ok: true, placed: apiRes });
-  } catch (e) {
-    console.error('[Webhook Error]', e.response?.data || e.message);
-    res.status(e.status || 500).json({ ok: false, error: e.response?.data || e.message });
+    const result = await placeMarketOrder(symbol, side, qty);
+    return res.json({ ok: true, result });
+  } catch (err) {
+    console.error("❌ Webhook error:", err.response?.data || err.message);
+    return res.status(500).json({ ok: false, error: err.response?.data || err.message });
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`✅ tv-bridge listening on :${PORT}`);
-  console.log(`   Webhook: http://0.0.0.0:${PORT}/webhook`);
+// --- Start ---
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`🚀 tv-tradovate-bridge listening on ${PORT} (env=${ENV})`);
 });
